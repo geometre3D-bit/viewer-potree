@@ -1,0 +1,383 @@
+<!DOCTYPE html>
+<html lang="fr">
+<head>
+	<meta charset="utf-8">
+	<meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
+	<title>Visualiseur Réseaux 3D</title>
+
+	<link rel="stylesheet" href="./libs/potree/potree.css">
+	<link rel="stylesheet" href="./libs/jquery-ui/jquery-ui.min.css">
+	<link rel="stylesheet" href="./libs/openlayers3/ol.css">
+	<link rel="stylesheet" href="./libs/spectrum/spectrum.css">
+	<link rel="stylesheet" href="./libs/jstree/themes/mixed/style.css">
+	<style>
+		.custom-filter-button {
+			position: absolute;
+			top: 80px;
+			right: 30px;
+			z-index: 1000;
+			background: white;
+			padding: 10px;
+			border-radius: 10px;
+			box-shadow: 0px 0px 10px rgba(0,0,0,0.3);
+			font-family: sans-serif;
+		}
+		#customSidebar {
+			position: absolute;
+			top: 100px;
+			right: 30px;
+			width: 300px;
+			background: rgba(255,255,255,0.95);
+			border-radius: 10px;
+			padding: 15px;
+			display: none;
+			box-shadow: 0px 0px 10px rgba(0,0,0,0.3);
+			font-family: sans-serif;
+			z-index: 9999;
+		}
+		#customSidebar table {
+			width: 100%;
+			font-size: 14px;
+			border-collapse: collapse;
+		}
+		#customSidebar td {
+			padding: 2px 6px;
+			border-bottom: 1px solid #ddd;
+		}
+	</style>
+</head>
+<body>
+	<div class="potree_container" style="position:absolute; width:100%; height:100%; left:0; top:0;">
+		<div id="potree_render_area"></div>
+		<div id="potree_sidebar_container"></div>
+		<div class="custom-filter-button">
+			<label><input type="checkbox" id="toggleTroncons" checked> Tronçons 3D</label><br>
+			<label><input type="checkbox" id="toggleAnomalies" checked> Anomalies</label><br>
+			<label><input type="checkbox" id="toggleReseaux" checked> Réseaux existants</label>
+		</div>
+	</div>
+
+	<div id="customSidebar">
+		<h3>Détails de l'objet</h3>
+		<div id="sidebarContent"></div>
+		<button onclick="document.getElementById('customSidebar').style.display='none'">Fermer</button>
+	</div>
+
+	<script src="./libs/jquery/jquery-3.1.1.min.js"></script>
+	<script src="./libs/spectrum/spectrum.js"></script>
+	<script src="./libs/jquery-ui/jquery-ui.min.js"></script>
+	<script src="./libs/other/BinaryHeap.js"></script>
+	<script src="./libs/tween/tween.min.js"></script>
+	<script src="./libs/d3/d3.js"></script>
+	<script src="./libs/proj4/proj4.js"></script>
+	<script src="./libs/openlayers3/ol.js"></script>
+	<script src="./libs/i18next/i18next.js"></script>
+	<script src="./libs/jstree/jstree.js"></script>
+	<script src="https://cdn.jsdelivr.net/npm/three@0.96.0/build/three.min.js"></script>
+	<script src="./libs/potree/potree.js"></script>
+	<script src="./libs/plasio/js/laslaz.js"></script>
+
+	<script>
+		const viewer = new Potree.Viewer(document.getElementById("potree_render_area"));
+		viewer.setEDLEnabled(true);
+		viewer.setFOV(60);
+		viewer.setPointBudget(20_000_000);
+		viewer.loadSettingsFromURL();
+		viewer.setDescription("");
+
+		// Canvas personnalisé pour la coupe 2D
+		let customOverlayCanvas = document.createElement("canvas");
+		customOverlayCanvas.style.position = "absolute";
+		customOverlayCanvas.style.left = "0";
+		customOverlayCanvas.style.top = "0";
+		customOverlayCanvas.style.pointerEvents = "none";
+
+		viewer.loadGUI(() => {
+			viewer.setLanguage('fr');
+			viewer.toggleSidebar();
+
+			viewer.profileTool.addEventListener("marker_moved", update3DCutOverlay);
+			viewer.profileWindow.addEventListener("render", update3DCutOverlay);
+			viewer.profileTool.addEventListener("profile_changed", () => {
+				setTimeout(() => {
+					const container = viewer.profileWindow.elContent;
+					if (!customOverlayCanvas.parentElement) {
+						container.appendChild(customOverlayCanvas);
+						console.log("✅ Canvas ajouté au profil");
+					}
+					customOverlayCanvas.width = container.clientWidth;
+					customOverlayCanvas.height = container.clientHeight;
+
+					update3DCutOverlay();
+				}, 300);
+			});
+		});
+
+		function update3DCutOverlay() {
+			const profile = viewer.profileTool.getLastProfile();
+			if (!profile || profile.points.length === 0) return;
+
+			const overlay = customOverlayCanvas;
+			const ctx = overlay.getContext("2d");
+
+			if (overlay.width === 0 || overlay.height === 0) {
+				const container = overlay.parentElement;
+				overlay.width = container.clientWidth || 600;
+				overlay.height = container.clientHeight || 400;
+			}
+
+			ctx.clearRect(0, 0, overlay.width, overlay.height);
+
+			groupAnomalies.children.forEach(obj => {
+				if (!obj.userData || !obj.userData.intitule) return;
+
+				const projected = projectToProfile(obj.position, profile);
+				if (!projected) return;
+
+				const transform = viewer.profileWindow.getTransformation();
+				const canvasX = transform(projected.x);
+				const canvasY = overlay.height - transform(projected.y);
+
+				ctx.fillStyle = "red";
+				ctx.beginPath();
+				ctx.arc(canvasX, canvasY, 4, 0, 2 * Math.PI);
+				ctx.fill();
+			});
+		}
+
+		function projectToProfile(position, profile) {
+			let totalDistance = 0;
+			for (let i = 1; i < profile.points.length; i++) {
+				const start = new THREE.Vector3(...profile.points[i - 1]);
+				const end = new THREE.Vector3(...profile.points[i]);
+				const segDir = new THREE.Vector3().subVectors(end, start);
+				const segLength = segDir.length();
+				segDir.normalize();
+
+				const toPoint = new THREE.Vector3().subVectors(position, start);
+				const projLength = toPoint.dot(segDir);
+
+				if (projLength >= 0 && projLength <= segLength) {
+					const height = position.z;
+					return { x: totalDistance + projLength, y: height };
+				}
+				totalDistance += segLength;
+			}
+			return null;
+		}
+		
+
+		viewer.scene.view.position.set(572900, 6724400, 120);
+		viewer.scene.view.lookAt(new THREE.Vector3(572900, 6724400, 113));
+
+		Potree.loadPointCloud("pointclouds/viewer3D2/cloud.js", "viewer3D2", e => {
+			let pointcloud = e.pointcloud;
+			let material = pointcloud.material;
+			viewer.scene.addPointCloud(pointcloud);
+			material.activeAttributeName = "classification"; //[rgba, intensity, classification, ...]
+			material.size = 1;
+			material.pointSizeType = Potree.PointSizeType.FIXED;
+			material.shape = Potree.PointShape.SQUARE;
+			viewer.fitToScreen();
+
+	
+
+	// 🔥 Centrage automatique
+	viewer.scene.view.position.copy(pointcloud.boundingBox.getCenter().clone().add(new THREE.Vector3(0, 0, 100)));
+	viewer.scene.view.lookAt(pointcloud.boundingBox.getCenter());
+	viewer.fitToScreen();
+		});
+
+		let groupTroncons = new THREE.Group();
+		let groupAnomalies = new THREE.Group();
+		let groupReseaux = new THREE.Group();
+		viewer.scene.scene.add(groupTroncons);
+		viewer.scene.scene.add(groupAnomalies);
+		viewer.scene.scene.add(groupReseaux);
+
+
+
+		const createLabel = (text, position) => {
+	const scaleFactor = 4;
+	const fontSize = 20;
+	const padding = 10;
+
+
+	// Prépare le canvas avec une haute résolution
+	const canvas = document.createElement("canvas");
+	const context = canvas.getContext("2d");
+
+	context.font = `${fontSize * scaleFactor}px Arial`;
+	const textWidth = context.measureText(text).width;
+
+	// Définir les dimensions du canvas
+	canvas.width = textWidth + padding * 2 * scaleFactor;
+	canvas.height = (fontSize + padding * 2) * scaleFactor;
+
+	// Mise à l’échelle pour une meilleure netteté
+	context.scale(scaleFactor, scaleFactor);
+
+	// Fond du label
+	context.fillStyle = "rgba(255, 255, 255, 0.9)";
+	context.fillRect(0, 0, canvas.width / scaleFactor, canvas.height / scaleFactor);
+
+	// Style du texte
+	context.fillStyle = "#000";
+	context.textAlign = "center";
+	context.textBaseline = "middle";
+	context.font = `${fontSize}px Arial`;
+	context.fillText(text, canvas.width / (2 * scaleFactor), canvas.height / (2 * scaleFactor));
+
+	// Création de la texture et du sprite
+	const texture = new THREE.CanvasTexture(canvas);
+	texture.minFilter = THREE.LinearFilter;
+
+	const material = new THREE.SpriteMaterial({ map: texture });
+	const sprite = new THREE.Sprite(material);
+	sprite.scale.set(10, 2, 1); // à ajuster selon la taille voulue
+
+	// Position au-dessus de l’objet
+	sprite.position.copy(position.clone().add(new THREE.Vector3(0, 0, 3)));
+
+	return sprite;
+		};
+
+		// Tronçons 3D
+		fetch("./models/troncons_3D.geojson")
+			.then(res => res.json())
+			.then(data => {
+				data.features.forEach(feature => {
+					const coords = feature.geometry.coordinates;
+					if (!coords || coords.length < 2) return;
+					const points = coords.map(c => new THREE.Vector3(c[0], c[1], c[2] || 0));
+					const diam = parseFloat(feature.properties["Diamètre"]) || 0.2;
+					const color = new THREE.Color("hsl(" + (diam * 360) + ",100%,50%)");
+
+					for (let i = 1; i < points.length; i++) {
+						const start = points[i - 1];
+						const end = points[i];
+						const dir = new THREE.Vector3().subVectors(end, start);
+						const length = dir.length();
+
+						const cylGeom = new THREE.CylinderGeometry(diam / 2, diam / 2, length, 8);
+						const cylMat = new THREE.MeshBasicMaterial({ color });
+						const cylinder = new THREE.Mesh(cylGeom, cylMat);
+						cylinder.userData = feature.properties;
+
+						const midpoint = new THREE.Vector3().addVectors(start, end).multiplyScalar(0.5);
+						cylinder.position.copy(midpoint);
+						cylinder.quaternion.setFromUnitVectors(new THREE.Vector3(0, 1, 0), dir.clone().normalize());
+
+						groupTroncons.add(cylinder);
+					}
+				});
+			});
+
+		// Anomalies
+		fetch("./models/anomalies.geojson")
+			.then(res => res.json())
+			.then(data => {
+				data.features.forEach(feature => {
+					const coords = feature.geometry.coordinates[0];
+					if (!coords || coords.length < 2) return;
+					const pos = new THREE.Vector3(coords[0], coords[1], coords[2] || 113);
+
+					const sphere = new THREE.Mesh(
+						new THREE.SphereGeometry(0.5, 16, 16),
+						new THREE.MeshBasicMaterial({ color: 0xff0000 })
+					);
+					sphere.position.copy(pos);
+					sphere.userData = feature.properties;
+					groupAnomalies.add(sphere);
+					groupAnomalies.add(createLabel(feature.properties.intitule || "anomalie", pos));
+				});
+			});
+
+		// Réseaux autres - cylindres comme tronçons
+		fetch("./models/reseaux_autres.geojson")
+			.then(res => res.json())
+			.then(data => {
+				const diametres = {
+					"GAZ-EXT": 1,
+					"ELEC-EXT": 0.3,
+					"FUEL-EXT": 0.5
+				};
+				const couleurs = {
+					"GAZ-EXT": 0xFFDC00,
+					"ELEC-EXT": 0xff0000,
+					"FUEL-EXT": 0x8B4513
+				};
+				data.features.forEach(feature => {
+					const layer = feature.properties.Layer;
+					if (!(layer in diametres)) return;
+
+					if (feature.geometry.type === "MultiLineString") {
+						feature.geometry.coordinates.forEach(lineCoords => {
+							const points = lineCoords.map(c => new THREE.Vector3(c[0], c[1], 112));
+							for (let i = 1; i < points.length; i++) {
+								const start = points[i - 1];
+								const end = points[i];
+								const dir = new THREE.Vector3().subVectors(end, start);
+								const length = dir.length();
+
+								let heightOffset = 0;
+								switch ((layer || "").toUpperCase()) {
+									case "ELEC-EXT": heightOffset = -0.3; break;
+									case "FUEL-EXT": heightOffset = -0.5; break;
+									case "GAZ-EXT": heightOffset = -1; break;
+} 
+
+
+								start.z += heightOffset;
+								end.z += heightOffset;
+
+								const cylGeom = new THREE.CylinderGeometry(diametres[layer] / 2, diametres[layer] / 2, length, 8);
+								const cylMat = new THREE.MeshBasicMaterial({ color: couleurs[layer] });
+								const cylinder = new THREE.Mesh(cylGeom, cylMat);
+								cylinder.userData = feature.properties;
+								const midpoint = new THREE.Vector3().addVectors(start, end).multiplyScalar(0.5);
+								cylinder.position.copy(midpoint);
+								cylinder.quaternion.setFromUnitVectors(new THREE.Vector3(0, 1, 0), dir.clone().normalize());
+								groupReseaux.add(cylinder);
+							}
+						});
+					}
+				});
+			});
+
+		document.getElementById("toggleTroncons").addEventListener("change", e => groupTroncons.visible = e.target.checked);
+		document.getElementById("toggleAnomalies").addEventListener("change", e => groupAnomalies.visible = e.target.checked);
+		document.getElementById("toggleReseaux").addEventListener("change", e => groupReseaux.visible = e.target.checked);
+
+		viewer.renderer.domElement.addEventListener("click", function (event) {
+			const rect = viewer.renderer.domElement.getBoundingClientRect();
+			const mouse = new THREE.Vector2(
+				((event.clientX - rect.left) / rect.width) * 2 - 1,
+				-((event.clientY - rect.top) / rect.height) * 2 + 1
+			);
+
+			viewer.scene.scene.updateMatrixWorld();
+			const camera = viewer.scene.getActiveCamera();
+			const raycaster = new THREE.Raycaster();
+			raycaster.setFromCamera(mouse, camera);
+			const intersects = raycaster.intersectObjects([
+				...groupAnomalies.children,
+				...groupTroncons.children,
+				...groupReseaux.children
+			], true);
+			if (intersects.length > 0) {
+				const props = intersects[0].object.userData;
+				if (props && Object.keys(props).length > 0) {
+					let content = "<table>";
+					for (const key in props) {
+						content += `<tr><td><strong>${key}</strong></td><td>${props[key]}</td></tr>`;
+					}
+					content += "</table>";
+					document.getElementById("sidebarContent").innerHTML = content;
+					document.getElementById("customSidebar").style.display = "block";
+				}
+			}
+		});
+	</script>
+</body>
+</html>
