@@ -50,18 +50,26 @@
 	<div class="potree_container" style="position:absolute; width:100%; height:100%; left:0; top:0;">
 		<div id="potree_render_area"></div>
 		<div id="potree_sidebar_container"></div>
+		<div id="map2D" style="position: absolute; bottom: 10px; left: 10px; width: 300px; height: 200px; z-index: 5000; border: 2px solid gray;"></div>
 		<div class="custom-filter-button">
-			<label><input type="checkbox" id="toggleTroncons" checked> Tronçons 3D</label><br>
+			<label><input type="checkbox" id="toggleTroncons" checked> Tronçons inspecté</label><br>
 			<label><input type="checkbox" id="toggleAnomalies" checked> Anomalies</label><br>
 			<label><input type="checkbox" id="toggleReseaux" checked> Réseaux existants</label>
+		<div id="photoPopup" style="display:none; position:fixed; top:50%; left:50%; transform:translate(-50%, -50%); background:white; padding:15px; box-shadow:0 0 20px rgba(0,0,0,0.5); border-radius:10px; z-index:10000;">
+			<span style="position:absolute; top:5px; right:10px; cursor:pointer; font-size:18px;" onclick="document.getElementById('photoPopup').style.display='none'">❌</span>
+			<h3 id="photoPopupTitle" style="margin-top:0;"></h3>
+			<img id="photoPopupImage" src="" style="max-width:90vw; max-height:70vh; border-radius:8px;">
 		</div>
+		
 	</div>
 
 	<div id="customSidebar">
 		<h3>Détails de l'objet</h3>
 		<div id="sidebarContent"></div>
 		<button onclick="document.getElementById('customSidebar').style.display='none'">Fermer</button>
+
 	</div>
+	
 
 	<script src="./libs/jquery/jquery-3.1.1.min.js"></script>
 	<script src="./libs/spectrum/spectrum.js"></script>
@@ -95,6 +103,48 @@
 		viewer.loadGUI(() => {
 			viewer.setLanguage('fr');
 			viewer.toggleSidebar();
+		
+			proj4.defs("EPSG:2154", "+proj=lcc +lat_1=49 +lat_2=44 +lat_0=46.5 +lon_0=3 +x_0=700000 +y_0=6600000 +ellps=GRS80 +towgs84=0,0,0,0,0,0,0 +units=m +no_defs");
+
+			// 🌍 Mini-carte OpenLayers liée à Potree
+			let map = new ol.Map({
+    target: 'map2D',
+    layers: [
+        new ol.layer.Tile({
+            source: new ol.source.XYZ({
+                url: 'https://{a-c}.tile.openstreetmap.org/{z}/{x}/{y}.png'
+            })
+        })
+    ],
+    view: new ol.View({
+        center: ol.proj.fromLonLat([1.309549, 47.607336]), // Longitude / Latitude de Blois
+        zoom: 16
+    }),
+    controls: ol.control.defaults({ attribution: false })
+});
+
+// 📍 Marqueur pour la position du viewer
+let viewerMarker = new ol.Overlay({
+    element: document.createElement('div'),
+    positioning: 'center-center',
+});
+viewerMarker.getElement().style.width = '12px';
+viewerMarker.getElement().style.height = '12px';
+viewerMarker.getElement().style.backgroundColor = 'red';
+viewerMarker.getElement().style.borderRadius = '50%';
+viewerMarker.getElement().style.border = '2px solid white';
+map.addOverlay(viewerMarker);
+
+// 🔥 Synchronisation en temps réel Potree → Carte
+viewer.addEventListener("update", () => {
+    const pos = viewer.scene.view.position;
+    const lonLat = proj4('EPSG:2154', 'EPSG:4326', [pos.x, pos.y]);
+    const coord = ol.proj.fromLonLat([lonLat[0], lonLat[1]]);
+    viewerMarker.setPosition(coord);
+
+    // Tu peux aussi centrer automatiquement la vue sur la position 3D si tu veux
+    // map.getView().setCenter(coord);
+});
 
 			viewer.profileTool.addEventListener("marker_moved", update3DCutOverlay);
 			viewer.profileWindow.addEventListener("render", update3DCutOverlay);
@@ -251,7 +301,7 @@
 					if (!coords || coords.length < 2) return;
 					const points = coords.map(c => new THREE.Vector3(c[0], c[1], c[2] || 0));
 					const diam = parseFloat(feature.properties["Diamètre"]) || 0.2;
-					const color = new THREE.Color("hsl(" + (diam * 360) + ",100%,50%)");
+					const color = new THREE.Color(0x8B4513);
 
 					for (let i = 1; i < points.length; i++) {
 						const start = points[i - 1];
@@ -354,7 +404,39 @@
 			const mouse = new THREE.Vector2(
 				((event.clientX - rect.left) / rect.width) * 2 - 1,
 				-((event.clientY - rect.top) / rect.height) * 2 + 1
+				
 			);
+
+			let lastHovered = null;
+
+viewer.renderer.domElement.addEventListener("mousemove", function (event) {
+	const rect = viewer.renderer.domElement.getBoundingClientRect();
+	const mouse = new THREE.Vector2(
+		((event.clientX - rect.left) / rect.width) * 2 - 1,
+		-((event.clientY - rect.top) / rect.height) * 2 + 1
+		
+	);
+
+	const camera = viewer.scene.getActiveCamera();
+	const raycaster = new THREE.Raycaster();
+	raycaster.setFromCamera(mouse, camera);
+
+	const intersects = raycaster.intersectObjects(groupTroncons.children, true);
+
+	if (lastHovered) {
+		lastHovered.material.color.set(0x8B4513); // 💡 Reviens au marron d'origine
+		lastHovered = null;
+	}
+
+	if (intersects.length > 0) {
+		const hovered = intersects[0].object;
+		if (hovered && hovered.material && hovered.material.color) {
+			lastHovered = hovered;
+			hovered.material.color.set(0xFFFF00); // 💥 Passe en jaune
+		}
+	}
+});
+
 
 			viewer.scene.scene.updateMatrixWorld();
 			const camera = viewer.scene.getActiveCamera();
@@ -369,9 +451,14 @@
 				const props = intersects[0].object.userData;
 				if (props && Object.keys(props).length > 0) {
 					let content = "<table>";
-					for (const key in props) {
-						content += `<tr><td><strong>${key}</strong></td><td>${props[key]}</td></tr>`;
-					}
+						for (const key in props) {
+    let value = props[key];
+    if (key.toLowerCase() === "photo" && typeof value === "string") {
+        // Si c'est un lien photo, on met un lien cliquable
+        value = `<a href="${value}" target="_blank">Voir la photo</a>`;
+    }
+    content += `<tr><td><strong>${key}</strong></td><td>${value}</td></tr>`;
+}
 					content += "</table>";
 					document.getElementById("sidebarContent").innerHTML = content;
 					document.getElementById("customSidebar").style.display = "block";
